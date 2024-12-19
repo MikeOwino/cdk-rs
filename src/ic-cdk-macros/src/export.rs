@@ -1,9 +1,8 @@
 use proc_macro2::{Ident, Span, TokenStream};
-use quote::quote;
+use quote::{format_ident, quote};
 use serde::Deserialize;
 use serde_tokenstream::from_tokenstream;
 use std::fmt::Formatter;
-use std::sync::atomic::{AtomicBool, Ordering};
 use syn::Error;
 use syn::{spanned::Spanned, FnArg, ItemFn, Pat, PatIdent, PatType, ReturnType, Signature, Type};
 
@@ -11,6 +10,18 @@ use syn::{spanned::Spanned, FnArg, ItemFn, Pat, PatIdent, PatType, ReturnType, S
 struct ExportAttributes {
     pub name: Option<String>,
     pub guard: Option<String>,
+    #[serde(default)]
+    pub manual_reply: bool,
+    #[serde(default)]
+    pub composite: bool,
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default)]
+    pub decoding_quota: Option<usize>,
+    #[serde(default = "default_skipping_quota")]
+    pub skipping_quota: Option<usize>,
+    #[serde(default)]
+    pub debug: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -22,18 +33,20 @@ enum MethodType {
     Query,
     Heartbeat,
     InspectMessage,
+    OnLowWasmMemory,
 }
 
 impl MethodType {
     pub fn is_lifecycle(&self) -> bool {
-        matches!(
-            self,
+        match self {
             MethodType::Init
-                | MethodType::PreUpgrade
-                | MethodType::PostUpgrade
-                | MethodType::Heartbeat
-                | MethodType::InspectMessage
-        )
+            | MethodType::PreUpgrade
+            | MethodType::PostUpgrade
+            | MethodType::Heartbeat
+            | MethodType::InspectMessage
+            | MethodType::OnLowWasmMemory => true,
+            MethodType::Update | MethodType::Query => false,
+        }
     }
 }
 
@@ -47,14 +60,19 @@ impl std::fmt::Display for MethodType {
             MethodType::Update => f.write_str("update"),
             MethodType::Heartbeat => f.write_str("heartbeat"),
             MethodType::InspectMessage => f.write_str("inspect_message"),
+            MethodType::OnLowWasmMemory => f.write_str("on_low_wasm_memory"),
         }
     }
+}
+
+fn default_skipping_quota() -> Option<usize> {
+    Some(10_000)
 }
 
 fn get_args(method: MethodType, signature: &Signature) -> Result<Vec<(Ident, Box<Type>)>, Error> {
     // We only need the tuple of arguments, not their types. Magic of type inference.
     let mut args = vec![];
-    for ref arg in &signature.inputs {
+    for (i, arg) in signature.inputs.iter().enumerate() {
         let (ident, ty) = match arg {
             FnArg::Receiver(r) => {
                 return Err(Error::new(
@@ -70,7 +88,7 @@ fn get_args(method: MethodType, signature: &Signature) -> Result<Vec<(Ident, Box
                     (ident.clone(), ty.clone())
                 } else {
                     (
-                        syn::Ident::new(&format!("arg_{}", crate::id()), pat.span()),
+                        format_ident!("__unnamed_arg_{i}", span = pat.span()),
                         ty.clone(),
                     )
                 }
@@ -88,7 +106,8 @@ fn dfn_macro(
     attr: TokenStream,
     item: TokenStream,
 ) -> Result<TokenStream, Error> {
-    let attrs = from_tokenstream::<ExportAttributes>(&attr)?;
+    let attrs = from_tokenstream::<ExportAttributes>(&attr)
+        .map_err(|e| Error::new(attr.span(), format!("Failed to deserialize {attr}. \n{e}")))?;
 
     let fun: ItemFn = syn::parse2::<syn::ItemFn>(item.clone()).map_err(|e| {
         Error::new(
@@ -130,20 +149,23 @@ fn dfn_macro(
         get_args(method, signature)?.iter().cloned().unzip();
     let name = &signature.ident;
 
-    let outer_function_ident = Ident::new(
-        &format!("{}_{}_", name.to_string(), crate::id()),
-        Span::call_site(),
-    );
+    let outer_function_ident = format_ident!("__canister_method_{name}");
 
+    let function_name = attrs.name.unwrap_or_else(|| name.to_string());
     let export_name = if method.is_lifecycle() {
         format!("canister_{}", method)
+    } else if method == MethodType::Query && attrs.composite {
+        format!("canister_composite_query {function_name}",)
     } else {
-        format!(
-            "canister_{0} {1}",
-            method,
-            attrs.name.unwrap_or_else(|| name.to_string())
-        )
+        if function_name.starts_with("<ic-cdk internal>") {
+            return Err(Error::new(
+                Span::call_site(),
+                "Functions starting with `<ic-cdk internal>` are reserved for CDK internal use.",
+            ));
+        }
+        format!("canister_{method} {function_name}")
     };
+    let host_compatible_name = export_name.replace(' ', ".").replace(['-', '<', '>'], "_");
 
     let function_call = if is_async {
         quote! { #name ( #(#arg_tuple),* ) .await }
@@ -153,7 +175,7 @@ fn dfn_macro(
 
     let arg_count = arg_tuple.len();
 
-    let return_encode = if method.is_lifecycle() {
+    let return_encode = if method.is_lifecycle() || attrs.manual_reply {
         quote! {}
     } else {
         match return_length {
@@ -169,10 +191,39 @@ fn dfn_macro(
     let arg_decode = if method.is_lifecycle() && arg_count == 0 {
         quote! {}
     } else {
-        quote! { let ( #( #arg_tuple, )* ) = ic_cdk::api::call::arg_data(); }
+        let decoding_quota = if let Some(n) = attrs.decoding_quota {
+            quote! { Some(#n) }
+        } else {
+            quote! { None }
+        };
+        let skipping_quota = if let Some(n) = attrs.skipping_quota {
+            quote! { Some(#n) }
+        } else {
+            quote! { None }
+        };
+        let debug = if attrs.debug {
+            quote! { true }
+        } else {
+            quote! { false }
+        };
+        let config = quote! {
+            ic_cdk::api::call::ArgDecoderConfig {
+                decoding_quota: #decoding_quota,
+                skipping_quota: #skipping_quota,
+                debug: #debug,
+            }
+        };
+        quote! { let ( #( #arg_tuple, )* ) = ic_cdk::api::call::arg_data(#config); }
     };
 
     let guard = if let Some(guard_name) = attrs.guard {
+        // ic_cdk::api::call::reject calls ic0::msg_reject which is only allowed in update/query
+        if method.is_lifecycle() {
+            return Err(Error::new(
+                attr.span(),
+                format!("#[{}] cannot have a guard function.", method),
+            ));
+        }
         let guard_ident = syn::Ident::new(&guard_name, Span::call_site());
 
         quote! {
@@ -186,14 +237,37 @@ fn dfn_macro(
         quote! {}
     };
 
+    let candid_method_attr = if attrs.hidden {
+        quote! {}
+    } else {
+        match method {
+            MethodType::Query if attrs.composite => {
+                quote! { #[::candid::candid_method(composite_query, rename = #function_name)] }
+            }
+            MethodType::Query => {
+                quote! { #[::candid::candid_method(query, rename = #function_name)] }
+            }
+            MethodType::Update => {
+                quote! { #[::candid::candid_method(update, rename = #function_name)] }
+            }
+            MethodType::Init => quote! { #[::candid::candid_method(init)] },
+            _ => quote! {},
+        }
+    };
+    let item = quote! {
+        #candid_method_attr
+        #item
+    };
+
     Ok(quote! {
-        #[export_name = #export_name]
+        #[cfg_attr(target_family = "wasm", export_name = #export_name)]
+        #[cfg_attr(not(target_family = "wasm"), export_name = #host_compatible_name)]
         fn #outer_function_ident() {
             ic_cdk::setup();
 
             #guard
 
-            ic_cdk::block_on(async {
+            ic_cdk::spawn(async {
                 #arg_decode
                 let result = #function_call;
                 #return_encode
@@ -215,72 +289,34 @@ pub(crate) fn ic_update(attr: TokenStream, item: TokenStream) -> Result<TokenStr
 #[derive(Default, Deserialize)]
 struct InitAttributes {}
 
-static IS_INIT: AtomicBool = AtomicBool::new(false);
-
 pub(crate) fn ic_init(attr: TokenStream, item: TokenStream) -> Result<TokenStream, Error> {
-    if IS_INIT.swap(true, Ordering::SeqCst) {
-        return Err(Error::new(
-            Span::call_site(),
-            "[init] function already declared.",
-        ));
-    }
-
     dfn_macro(MethodType::Init, attr, item)
 }
 
-static HAS_PRE_UPGRADE: AtomicBool = AtomicBool::new(false);
-
 pub(crate) fn ic_pre_upgrade(attr: TokenStream, item: TokenStream) -> Result<TokenStream, Error> {
-    if HAS_PRE_UPGRADE.swap(true, Ordering::SeqCst) {
-        return Err(Error::new(
-            Span::call_site(),
-            "[pre_upgrade] function already declared.",
-        ));
-    }
-
     dfn_macro(MethodType::PreUpgrade, attr, item)
 }
 
-static HAS_POST_UPGRADE: AtomicBool = AtomicBool::new(false);
-
 pub(crate) fn ic_post_upgrade(attr: TokenStream, item: TokenStream) -> Result<TokenStream, Error> {
-    if HAS_POST_UPGRADE.swap(true, Ordering::SeqCst) {
-        return Err(Error::new(
-            Span::call_site(),
-            "[post_upgrade] function already declared.",
-        ));
-    }
-
     dfn_macro(MethodType::PostUpgrade, attr, item)
 }
 
-static HAS_HEARTBEAT: AtomicBool = AtomicBool::new(false);
-
 pub(crate) fn ic_heartbeat(attr: TokenStream, item: TokenStream) -> Result<TokenStream, Error> {
-    if HAS_HEARTBEAT.swap(true, Ordering::SeqCst) {
-        return Err(Error::new(
-            Span::call_site(),
-            "[heartbeat] function already declared.",
-        ));
-    }
-
     dfn_macro(MethodType::Heartbeat, attr, item)
 }
-
-static HAS_INSPECT_MESSAGE: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn ic_inspect_message(
     attr: TokenStream,
     item: TokenStream,
 ) -> Result<TokenStream, Error> {
-    if HAS_INSPECT_MESSAGE.swap(true, Ordering::SeqCst) {
-        return Err(Error::new(
-            Span::call_site(),
-            "[inspect_message] function already declared.",
-        ));
-    }
-
     dfn_macro(MethodType::InspectMessage, attr, item)
+}
+
+pub(crate) fn ic_on_low_wasm_memory(
+    attr: TokenStream,
+    item: TokenStream,
+) -> Result<TokenStream, Error> {
+    dfn_macro(MethodType::OnLowWasmMemory, attr, item)
 }
 
 #[cfg(test)]
@@ -303,11 +339,18 @@ mod test {
         };
 
         let expected = quote! {
-            #[export_name = "canister_query query"]
+            #[cfg_attr(target_family = "wasm", export_name = "canister_query query")]
+            #[cfg_attr(not(target_family = "wasm"), export_name = "canister_query.query")]
             fn #fn_name() {
                 ic_cdk::setup();
-                ic_cdk::block_on(async {
-                    let () = ic_cdk::api::call::arg_data();
+                ic_cdk::spawn(async {
+                    let () = ic_cdk::api::call::arg_data(
+                        ic_cdk::api::call::ArgDecoderConfig {
+                            decoding_quota: None,
+                            skipping_quota: Some(10000usize),
+                            debug: false,
+                        }
+                    );
                     let result = query();
                     ic_cdk::api::call::reply(())
                 });
@@ -323,7 +366,6 @@ mod test {
             _ => panic!("not a function"),
         };
     }
-
     #[test]
     fn ic_query_return_one_value() {
         let generated = ic_query(
@@ -340,11 +382,18 @@ mod test {
         };
 
         let expected = quote! {
-            #[export_name = "canister_query query"]
+            #[cfg_attr(target_family = "wasm", export_name = "canister_query query")]
+            #[cfg_attr(not(target_family = "wasm"), export_name = "canister_query.query")]
             fn #fn_name() {
                 ic_cdk::setup();
-                ic_cdk::block_on(async {
-                    let () = ic_cdk::api::call::arg_data();
+                ic_cdk::spawn(async {
+                    let () = ic_cdk::api::call::arg_data(
+                        ic_cdk::api::call::ArgDecoderConfig {
+                            decoding_quota: None,
+                            skipping_quota: Some(10000usize),
+                            debug: false,
+                        }
+                    );
                     let result = query();
                     ic_cdk::api::call::reply((result,))
                 });
@@ -377,11 +426,18 @@ mod test {
         };
 
         let expected = quote! {
-            #[export_name = "canister_query query"]
+            #[cfg_attr(target_family = "wasm", export_name = "canister_query query")]
+            #[cfg_attr(not(target_family = "wasm"), export_name = "canister_query.query")]
             fn #fn_name() {
                 ic_cdk::setup();
-                ic_cdk::block_on(async {
-                    let () = ic_cdk::api::call::arg_data();
+                ic_cdk::spawn(async {
+                    let () = ic_cdk::api::call::arg_data(
+                        ic_cdk::api::call::ArgDecoderConfig {
+                            decoding_quota: None,
+                            skipping_quota: Some(10000usize),
+                            debug: false,
+                        }
+                    );
                     let result = query();
                     ic_cdk::api::call::reply(result)
                 });
@@ -414,11 +470,18 @@ mod test {
         };
 
         let expected = quote! {
-            #[export_name = "canister_query query"]
+            #[cfg_attr(target_family = "wasm", export_name = "canister_query query")]
+            #[cfg_attr(not(target_family = "wasm"), export_name = "canister_query.query")]
             fn #fn_name() {
                 ic_cdk::setup();
-                ic_cdk::block_on(async {
-                    let (a, ) = ic_cdk::api::call::arg_data();
+                ic_cdk::spawn(async {
+                    let (a, ) = ic_cdk::api::call::arg_data(
+                        ic_cdk::api::call::ArgDecoderConfig {
+                            decoding_quota: None,
+                            skipping_quota: Some(10000usize),
+                            debug: false,
+                        }
+                    );
                     let result = query(a);
                     ic_cdk::api::call::reply(())
                 });
@@ -451,11 +514,18 @@ mod test {
         };
 
         let expected = quote! {
-            #[export_name = "canister_query query"]
+            #[cfg_attr(target_family = "wasm", export_name = "canister_query query")]
+            #[cfg_attr(not(target_family = "wasm"), export_name = "canister_query.query")]
             fn #fn_name() {
                 ic_cdk::setup();
-                ic_cdk::block_on(async {
-                    let (a, b, ) = ic_cdk::api::call::arg_data();
+                ic_cdk::spawn(async {
+                    let (a, b, ) = ic_cdk::api::call::arg_data(
+                        ic_cdk::api::call::ArgDecoderConfig {
+                            decoding_quota: None,
+                            skipping_quota: Some(10000usize),
+                            debug: false,
+                        }
+                    );
                     let result = query(a, b);
                     ic_cdk::api::call::reply(())
                 });
@@ -488,11 +558,18 @@ mod test {
         };
 
         let expected = quote! {
-            #[export_name = "canister_query query"]
+            #[cfg_attr(target_family = "wasm", export_name = "canister_query query")]
+            #[cfg_attr(not(target_family = "wasm"), export_name = "canister_query.query")]
             fn #fn_name() {
                 ic_cdk::setup();
-                ic_cdk::block_on(async {
-                    let (a, b, ) = ic_cdk::api::call::arg_data();
+                ic_cdk::spawn(async {
+                    let (a, b, ) = ic_cdk::api::call::arg_data(
+                        ic_cdk::api::call::ArgDecoderConfig {
+                            decoding_quota: None,
+                            skipping_quota: Some(10000usize),
+                            debug: false,
+                        }
+                    );
                     let result = query(a, b);
                     ic_cdk::api::call::reply((result,))
                 });
@@ -525,11 +602,18 @@ mod test {
         };
 
         let expected = quote! {
-            #[export_name = "canister_query custom_query"]
+            #[cfg_attr(target_family = "wasm", export_name = "canister_query custom_query")]
+            #[cfg_attr(not(target_family = "wasm"), export_name = "canister_query.custom_query")]
             fn #fn_name() {
                 ic_cdk::setup();
-                ic_cdk::block_on(async {
-                    let () = ic_cdk::api::call::arg_data();
+                ic_cdk::spawn(async {
+                    let () = ic_cdk::api::call::arg_data(
+                        ic_cdk::api::call::ArgDecoderConfig {
+                            decoding_quota: None,
+                            skipping_quota: Some(10000usize),
+                            debug: false,
+                        }
+                    );
                     let result = query();
                     ic_cdk::api::call::reply(())
                 });

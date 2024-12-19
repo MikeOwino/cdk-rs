@@ -1,4 +1,6 @@
-#[ic_cdk_macros::query]
+#[ic_cdk::query]
 fn print() {
     ic_cdk::print("Hello World");
 }
+
+ic_cdk::export_candid!();

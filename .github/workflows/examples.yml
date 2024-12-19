@@ -1,4 +1,3 @@
-
 name: Examples
 
 on:
@@ -6,62 +5,128 @@ on:
     branches:
       - main
   pull_request:
+  schedule:
+    - cron: "0 4 * * 0,3" # 4 a.m. UTC every Sun and Wed, keep actions-cache available
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ic-wasm-version: 0.4.0
 
 jobs:
-  test:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        build: [ linux-stable ]
-        include:
-          - build: linux-stable
-            os: ubuntu-latest
-            rust: 1.52.1
-            dfx: 0.8.1
-
+  build-candid-extractor:
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v2
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/cache@v2
+      - name: Cache
+        uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            **/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-1
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-candid-extractor-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-candid-extractor-
+            ${{ runner.os }}-
 
-      - name: Install Rust
+      - name: Build candid-extractor
+        run: cargo build -p candid-extractor --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candid-extractor
+          path: target/release/candid-extractor
+
+  test:
+    runs-on: ubuntu-24.04
+    needs: build-candid-extractor
+    strategy:
+      fail-fast: false
+      matrix:
+        project-name:
+          [asset_storage, chess, counter, management_canister, print, profile]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            examples/${{ matrix.project-name }}/target/
+          key: ${{ runner.os }}-${{ matrix.project-name }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.project-name }}-
+            ${{ runner.os }}-
+
+      - name: Install ic-wasm
+        # might already in cache
         run: |
-          rustup update ${{ matrix.rust }} --no-self-update
-          rustup default ${{ matrix.rust }}
-          rustup target add wasm32-unknown-unknown
+          wget https://github.com/dfinity/ic-wasm/releases/download/${{env.ic-wasm-version }}/ic-wasm-linux64
+          chmod 755 ic-wasm-linux64
+          mv ic-wasm-linux64 /usr/local/bin/ic-wasm
+
+      - name: Download candid-extractor
+        uses: actions/download-artifact@v4
+        with:
+          name: candid-extractor
+
+      - name: Install candid-extractor
+        run: |
+          chmod 755 candid-extractor
+          mv candid-extractor /usr/local/bin/candid-extractor
 
       - name: Install DFX
-        run: |
-          export DFX_VERSION=${{ matrix.dfx }}
-          echo Install DFX Version: $DFX_VERSION
-          yes | sh -ci "$(curl -fsSL https://sdk.dfinity.org/install.sh)"
+        uses: dfinity/setup-dfx@main
 
-      - name: Setup BATS
-        uses: mig4/setup-bats@v1.0.2
-        with:
-          bats-version: 1.2.1
+      - name: Install bitcoin
+        if: ${{ matrix.project-name == 'management_canister' }}
+        run: |
+          CWD=$(pwd)
+          cd "$(mktemp -d)"
+          BITCOIN_CORE_VERSION=22.0
+          BITCOIN_CORE_FILENAME="bitcoin-$BITCOIN_CORE_VERSION-x86_64-linux-gnu.tar.gz"
+          BITCOIN_CORE_TARBALL_SHA="59ebd25dd82a51638b7a6bb914586201e67db67b919b2a1ff08925a7936d1b16"
+          wget -nv "https://bitcoin.org/bin/bitcoin-core-$BITCOIN_CORE_VERSION/$BITCOIN_CORE_FILENAME"
+          echo "$BITCOIN_CORE_TARBALL_SHA  $BITCOIN_CORE_FILENAME" | shasum -c
+          tar xzf "$BITCOIN_CORE_FILENAME"
+          cd "bitcoin-$BITCOIN_CORE_VERSION/bin"
+          sudo install -m 0755 -o root -g root -t /usr/local/bin *
+          cd "$CWD"
 
       - name: Run Tests
         shell: bash
         run: |
-          echo CWD: $(pwd)
-          export PATH=$PATH:$HOME/bin
-          bats -r examples
+          ./examples/bats/bats-core/bin/bats -r examples/${{ matrix.project-name }}
         env:
           RUST_BACKTRACE: 1
 
-      - name: Purge for OSX
-        if: matrix.os == 'macos-latest'
+      - name: cargo fmt # no clippy because build.rs using ic-cdk-bindgen would fail
         run: |
-          # There is a bug with BSD tar on macOS where the first 8MB of the file are
-          # sometimes all NUL bytes. See https://github.com/actions/cache/issues/403
-          # and https://github.com/rust-lang/cargo/issues/8603 for some more
-          # information. An alternative solution here is to install GNU tar, but
-          # flushing the disk cache seems to work, too.
-          sudo /usr/sbin/purge
+          pushd examples/${{ matrix.project-name }}
+          cargo fmt --check
+          popd
+
+  aggregate:
+    name: examples:required
+    if: ${{ always() }}
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check step result directly
+        if: ${{ needs.test.result != 'success' }}
+        run: exit 1
